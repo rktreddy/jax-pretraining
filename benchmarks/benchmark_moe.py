@@ -21,16 +21,23 @@ import time
 import jax
 import jax.numpy as jnp
 
-from kernels.fused_moe_pallas_v2 import moe_ffn_fused_pallas_v2
+from kernels.fused_moe_pallas_v2 import (
+    moe_ffn_fused_pallas_tpu,
+    moe_ffn_fused_pallas_v2,
+)
 from moe.ragged_moe import moe_ffn_loop, moe_ffn_ragged
 
 # (fp16/bf16 matmul FLOP/s, fp32 matmul FLOP/s, HBM bytes/s) - approximate peaks
+# TPU entries are per core (one Pallas kernel runs on one core).
 _DEVICE_PEAKS: dict[str, tuple[float, float, float]] = {
     "t4": (65e12, 8.1e12, 300e9),
     "l4": (121e12, 30e12, 300e9),
     "v100": (125e12, 15.7e12, 900e9),
     "a100": (312e12, 19.5e12, 1.6e12),
     "h100": (990e12, 67e12, 3.35e12),
+    "tpu v2": (23e12, 3e12, 350e9),
+    "tpu v3": (61e12, 4e12, 450e9),
+    "v5 lite": (197e12, 12e12, 819e9),  # v5e reports as "TPU v5 lite"
 }
 
 _DTYPES = {"f32": jnp.float32, "f16": jnp.float16, "bf16": jnp.bfloat16}
@@ -97,12 +104,18 @@ def run_benchmark(
     interpret: bool | None,
 ) -> None:
     kind, peaks = device_peaks()
+    platform = jax.devices()[0].platform
+    if platform == "tpu" and dtype_name == "f16":
+        print("TPU has no fp16 - switching to bf16")
+        dtype_name = "bf16"
     dtype = _DTYPES[dtype_name]
     itemsize = jnp.dtype(dtype).itemsize
     if interpret is None:
-        interpret = jax.devices()[0].platform == "cpu"
+        interpret = platform == "cpu"
+    fused_impl = moe_ffn_fused_pallas_tpu if platform == "tpu" else moe_ffn_fused_pallas_v2
 
-    print(f"Device: {kind} | dtype={dtype_name} | interpret={interpret}")
+    print(f"Device: {kind} | dtype={dtype_name} | interpret={interpret} "
+          f"| kernel={fused_impl.__name__}")
     if interpret:
         print("  (interpret mode: correctness only, timings are meaningless)")
     print(
@@ -122,7 +135,7 @@ def run_benchmark(
         "ragged_dot": jax.jit(moe_ffn_ragged),
         "fused_pallas": jax.jit(
             functools.partial(
-                moe_ffn_fused_pallas_v2,
+                fused_impl,
                 block_m=block_m, f_tile=f_tile, interpret=interpret,
             )
         ),

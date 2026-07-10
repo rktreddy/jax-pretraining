@@ -9,7 +9,7 @@ dense vs top-1 MoE, trained without curriculum (uniform operands from step 1).
 - **Tokens (D):** answer tokens only, matching what the loss trains on
 - **Compute:** `FLOPs ~ 6 x N_active x D` (training)
 - **MoE:** 4 experts, top-1 routing; `N_active` counts one expert FFN per layer
-- **Runs:** 17 total (9 dense, 8 MoE) - 1 still pending
+- **Runs:** 18 total (9 dense, 9 MoE)
 
 ## Results
 
@@ -32,6 +32,7 @@ dense vs top-1 MoE, trained without curriculum (uniform operands from step 1).
 | moe | small | 807,184 | 1,992,269 | 0.0105 | 98.4% | 9.65e+12 |
 | moe | medium | 3,661,528 | 495,683 | 0.1449 | 90.6% | 1.09e+13 |
 | moe | medium | 3,661,528 | 998,502 | 0.0316 | 95.3% | 2.19e+13 |
+| moe | medium | 3,661,528 | 1,992,269 | 0.0093 | 100.0% | 4.38e+13 |
 
 ## Fitted scaling laws
 
@@ -43,7 +44,7 @@ means (N0, D0); relative-error weighting.
 | arch | a | alpha | b | beta | rel. rmse |
 |------|---|-------|---|------|-----------|
 | dense | 0.0097 | 1.49 | 0.0279 | 2.33 | 0.39 |
-| moe | 0.0076 | 1.66 | 0.0409 | 2.31 | 0.37 |
+| moe | 0.0033 | 1.91 | 0.0367 | 2.14 | 0.35 |
 
 ### dense: compute-optimal allocation
 
@@ -54,9 +55,9 @@ means (N0, D0); relative-error weighting.
 
 ### moe: compute-optimal allocation
 
-- @ 1e+12 FLOPs: N=173,902, D=958,394 (D/N=5.5), predicted loss=0.0874
-- @ 1e+13 FLOPs: N=664,316, D=2,508,846 (D/N=3.8), predicted loss=0.0095
-- @ 1e+14 FLOPs: N=2,537,725, D=6,567,563 (D/N=2.6), predicted loss=0.0010
+- @ 1e+12 FLOPs: N=173,537, D=960,410 (D/N=5.5), predicted loss=0.0841
+- @ 1e+13 FLOPs: N=586,156, D=2,843,383 (D/N=4.9), predicted loss=0.0083
+- @ 1e+14 FLOPs: N=1,979,862, D=8,418,097 (D/N=4.3), predicted loss=0.0008
 - Cheapest run at >=95% accuracy: preset `medium`, N_active=3,661,528, D=998,502, FLOPs=2.19e+13
 
 ## Findings

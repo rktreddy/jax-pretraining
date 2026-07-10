@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Model checkpoints and run artifacts
+checkpoints/
+run1.zip

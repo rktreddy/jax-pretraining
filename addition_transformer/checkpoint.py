@@ -62,6 +62,15 @@ def load_checkpoint(
     checkpoint_dir = _resolve(checkpoint_dir)
     config = load_config(checkpoint_dir)
     state = make_train_state(jax.random.key(0), config)
-    params = ocp.StandardCheckpointer().restore(_params_path(checkpoint_dir))
+    # Restore against abstract shapes so checkpoints saved on one device type
+    # (e.g. cuda) load on another (e.g. cpu).
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    abstract_params = jax.tree_util.tree_map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding),
+        state.params,
+    )
+    params = ocp.StandardCheckpointer().restore(
+        _params_path(checkpoint_dir), abstract_params
+    )
     return state.replace(params=params)
 

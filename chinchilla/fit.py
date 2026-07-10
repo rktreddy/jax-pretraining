@@ -33,6 +33,78 @@ class ScalingLawFit:
         return (self.B / residual) ** (1.0 / self.beta)
     
 
+@dataclass
+class FreeScalingLawFit:
+    """L(N, D) = a * (N/N0)^-alpha + b * (D/D0)^-beta, exponents fitted.
+
+    Centered at the data's geometric means (N0, D0) so coefficients and
+    exponents stay decorrelated when N and D span few orders of magnitude.
+    """
+
+    a: float
+    b: float
+    alpha: float
+    beta: float
+    n0: float
+    d0: float
+    rel_rmse: float
+
+    def predict(self, n_params: np.ndarray, tokens: np.ndarray) -> np.ndarray:
+        return (
+            self.a * (n_params / self.n0) ** -self.alpha
+            + self.b * (tokens / self.d0) ** -self.beta
+        )
+
+    def to_chinchilla(self) -> ScalingLawFit:
+        """Convert to the uncentered E + A/N^a + B/D^b form (E = 0)."""
+        return ScalingLawFit(
+            E=0.0,
+            A=self.a * self.n0**self.alpha,
+            B=self.b * self.d0**self.beta,
+            alpha=self.alpha,
+            beta=self.beta,
+            rmse=self.rel_rmse,
+        )
+
+
+def fit_scaling_law_free(
+    runs: list[dict],
+    *,
+    use_active_params: bool = True,
+) -> FreeScalingLawFit:
+    """Fit a, b, alpha, beta jointly (E pinned to 0; needs scipy).
+
+    Uses relative error weighting (sigma = loss) so small late-training losses
+    count as much as large early ones.
+    """
+    from scipy.optimize import curve_fit
+
+    key = "n_active_params" if use_active_params else "n_params"
+    n = np.array([r[key] for r in runs], dtype=np.float64)
+    d = np.array([r["tokens"] for r in runs], dtype=np.float64)
+    loss = np.array([r["final_loss"] for r in runs], dtype=np.float64)
+    n0 = float(np.exp(np.mean(np.log(n))))
+    d0 = float(np.exp(np.mean(np.log(d))))
+
+    def model(x, a, b, alpha, beta):
+        nn, dd = x
+        return a * (nn / n0) ** -alpha + b * (dd / d0) ** -beta
+
+    popt, _ = curve_fit(
+        model,
+        (n, d),
+        loss,
+        p0=[0.1, 0.1, 0.5, 0.5],
+        bounds=([1e-6, 1e-6, 0.05, 0.05], [10.0, 10.0, 4.0, 4.0]),
+        sigma=np.maximum(loss, 1e-3),
+        maxfev=50_000,
+    )
+    a, b, alpha, beta = (float(v) for v in popt)
+    pred = model((n, d), *popt)
+    rel_rmse = float(np.sqrt(np.mean(((loss - pred) / np.maximum(loss, 1e-3)) ** 2)))
+    return FreeScalingLawFit(a, b, alpha, beta, n0, d0, rel_rmse)
+
+
 def fit_scaling_law(
     runs: list[dict],
     *,

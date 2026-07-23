@@ -247,6 +247,77 @@ def fused_moe_pallas_tpu_sorted(
     return yg.reshape(m, d_model)
 
 
+def _fused_kernel_ragged_tpu(bte_ref, x_ref, wu_ref, wd_ref, y_ref, acc_ref):
+    """One (token-block, F-tile) grid step, ragged routing.
+
+    bte_ref is the scalar-prefetch block_to_expert map (SMEM). It is consumed
+    by the BlockSpec index_maps, not here - by the time this body runs, wu_ref
+    and wd_ref already hold the right expert's F tile. The body is therefore
+    identical to the balanced TPU kernel.
+
+    Refs (BlockSpec-staged into VMEM unless noted):
+        bte_ref: (n_blocks,) int32 in SMEM - scalar prefetch
+        x_ref:   (bm, D)    - same block for every j
+        wu_ref:  (1, D, bf) - j-th F tile of this block's expert
+        wd_ref:  (1, bf, D)
+        y_ref:   (bm, D)    - same output block for every j
+        acc_ref: (bm, D) fp32 scratch, persists across sequential grid steps
+    """
+    j = pl.program_id(1)
+
+    @pl.when(j == 0)
+    def _init():
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    x = x_ref[...]
+    wu = wu_ref[0]
+    wd = wd_ref[0]
+    h = jax.nn.gelu(jnp.dot(x, wu, preferred_element_type=jnp.float32))
+    h = h.astype(x.dtype)
+    acc_ref[...] += jnp.dot(h, wd, preferred_element_type=jnp.float32)
+
+    @pl.when(j == pl.num_programs(1) - 1)
+    def _store():
+        y_ref[...] = acc_ref[...].astype(y_ref.dtype)
+
+
+def moe_ffn_fused_ragged_tpu(x, w_up, w_down, expert_idx, *, block_m=128, f_tile=128, interpret=False):
+    """Fused MoE FFN for unbalanced (ragged) routing, TPU-style.
+
+    block_to_expert rides in as a scalar-prefetch argument: Mosaic reads it
+    in SMEM *before* each grid step and feeds it to the index_maps, so the
+    weight pipeline itself steers to the right expert per token block.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    n_experts, d_model, d_ff = w_up.shape
+    orig_shape = x.shape
+    padded_x, block_to_expert, dest = route_tokens_block_padded(
+        x.reshape(-1, x.shape[-1]), expert_idx, n_experts, block_m
+    )
+    n_blocks = padded_x.shape[0] // block_m
+
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        grid=(n_blocks, d_ff // f_tile),
+        in_specs=[
+            pl.BlockSpec((block_m, d_model), lambda i, j, bte: (i, 0)),
+            pl.BlockSpec((1, d_model, f_tile), lambda i, j, bte: (bte[i], 0, j)),
+            pl.BlockSpec((1, f_tile, d_model), lambda i, j, bte: (bte[i], j, 0)),
+        ],
+        out_specs=pl.BlockSpec((block_m, d_model), lambda i, j, bte: (i, 0)),
+        scratch_shapes=[pltpu.VMEM((block_m, d_model), jnp.float32)],
+    )
+    padded_y = pl.pallas_call(
+        _fused_kernel_ragged_tpu,
+        grid_spec=grid_spec,
+        out_shape=jax.ShapeDtypeStruct(padded_x.shape, x.dtype),
+        interpret=interpret,
+    )(block_to_expert, padded_x, w_up, w_down)
+
+    return padded_y[dest].reshape(orig_shape)
+
+
 def moe_ffn_fused_pallas_tpu(
     x: jnp.ndarray,
     w_up: jnp.ndarray,

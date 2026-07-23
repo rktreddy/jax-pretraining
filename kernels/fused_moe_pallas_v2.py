@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from moe.routing import route_tokens, unroute_tokens
+from moe.routing import route_tokens, unroute_tokens, route_tokens_block_padded
 
 
 def _fused_kernel(x_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, d_ff: int):
@@ -49,6 +49,64 @@ def _fused_kernel(x_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, d_ff: int):
         acc = acc + jnp.dot(h, wd, preferred_element_type=jnp.float32)
 
     y_ref[0] = acc.astype(y_ref.dtype)
+
+
+
+def _fused_kernel_ragged(x_ref, bte_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, d_ff: int):
+    """One (expert, token-block) program.
+
+    Refs:
+        x_ref:  (1, bm, D) block in SRAM (BlockSpec-staged)
+        wu_ref: (G, D, F) full array in HBM - load tiles manually
+        wd_ref: (G, F, D) full array in HBM - load tiles manually
+        y_ref:  (1, bm, D) output block in SRAM
+    """
+    e = pl.load(bte_ref, (pl.program_id(0),))  # which expert this program serves
+
+    x = x_ref[...]  # (bm, D) - staged into SRAM by the BlockSpec
+    acc = jnp.zeros((x.shape[0], x.shape[1]), dtype=jnp.float32)
+
+    for j in range(d_ff // f_tile):  # static bound -> unrolled at trace time
+        # (D, f_tile) slice of this expert's up-projection, HBM -> SRAM
+        wu = pl.load(wu_ref, (e, slice(None), pl.dslice(j * f_tile, f_tile)))
+        # (bm, f_tile) sliver of the hidden activation. This is the fusion:
+        # h lives only in SRAM/registers and dies at the end of the iteration -
+        # the full (bm, F) intermediate never exists.
+        h = jax.nn.gelu(jnp.dot(x, wu, preferred_element_type=jnp.float32))
+        h = h.astype(x.dtype)  # back to input dtype so the MMA units engage
+        # (f_tile, D) slice of the down-projection
+        wd = pl.load(wd_ref, (e, pl.dslice(j * f_tile, f_tile), slice(None)))
+        # partial contraction over this F tile; fp32 accumulation
+        acc = acc + jnp.dot(h, wd, preferred_element_type=jnp.float32)
+
+    y_ref[...] = acc.astype(y_ref.dtype)
+
+
+
+def moe_ffn_fused_ragged_v2(x, w_up, w_down, expert_idx, *, block_m=128, f_tile=128, interpret=False):
+    """Fused MoE FFN for unbalanced (ragged) routing GPU-style."""
+    n_experts, d_model, d_ff = w_up.shape
+    orig_shape = x.shape
+    padded_x, block_to_expert, dest = route_tokens_block_padded(
+        x.reshape(-1, x.shape[-1]), expert_idx, n_experts, block_m
+    )
+    n_blocks = padded_x.shape[0] // block_m
+    kernel = functools.partial(_fused_kernel_ragged, f_tile=f_tile,d_ff=d_ff)
+    padded_y = pl.pallas_call(
+        kernel,
+        grid=(n_blocks,),
+        in_specs=[
+            pl.BlockSpec((block_m, d_model), lambda i: (i, 0)),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=pl.BlockSpec((block_m, d_model), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct(padded_x.shape, x.dtype),
+        interpret=interpret,
+    )(padded_x, block_to_expert, w_up, w_down)
+    
+    return padded_y[dest].reshape(orig_shape)
 
 
 def fused_moe_pallas_v2_sorted(

@@ -24,6 +24,8 @@ import jax.numpy as jnp
 from kernels.fused_moe_pallas_v2 import (
     moe_ffn_fused_pallas_tpu,
     moe_ffn_fused_pallas_v2,
+    moe_ffn_fused_ragged_tpu,
+    moe_ffn_fused_ragged_v2,
 )
 from moe.ragged_moe import moe_ffn_loop, moe_ffn_ragged
 
@@ -50,14 +52,19 @@ def device_peaks() -> tuple[str, tuple[float, float, float] | None]:
     return f"{dev.platform}:{dev.device_kind}", peaks
 
 
-def make_balanced_inputs(key, *, tokens, d, f, n_experts, dtype):
-    """Round-robin routing -> exactly tokens/n_experts per expert."""
+def make_inputs(key, *, tokens, d, f, n_experts, dtype, skew=0.0):
+    """skew=0: round-robin, exactly tokens/n_experts per expert.
+    skew>0: expert 0 gets ~skew of all tokens, rest split the remainder."""
     assert tokens % n_experts == 0
-    keys = jax.random.split(key, 3)
+    keys = jax.random.split(key, 4)
     x = jax.random.normal(keys[0], (tokens, d), dtype=jnp.float32).astype(dtype)
     w_up = (jax.random.normal(keys[1], (n_experts, d, f)) * 0.05).astype(dtype)
     w_down = (jax.random.normal(keys[2], (n_experts, f, d)) * 0.05).astype(dtype)
-    idx = jnp.tile(jnp.arange(n_experts), tokens // n_experts)
+    if skew > 0:
+        p = jnp.array([skew] + [(1 - skew) / (n_experts - 1)] * (n_experts - 1))
+        idx = jax.random.choice(keys[3], n_experts, (tokens,), p=p)
+    else:
+        idx = jnp.tile(jnp.arange(n_experts), tokens // n_experts)
     return x, w_up, w_down, idx
 
 
@@ -102,6 +109,7 @@ def run_benchmark(
     iters: int,
     dtype_name: str,
     interpret: bool | None,
+    skew: float = 0.0,
 ) -> None:
     kind, peaks = device_peaks()
     platform = jax.devices()[0].platform
@@ -113,19 +121,20 @@ def run_benchmark(
     if interpret is None:
         interpret = platform == "cpu"
     fused_impl = moe_ffn_fused_pallas_tpu if platform == "tpu" else moe_ffn_fused_pallas_v2
+    ragged_impl = moe_ffn_fused_ragged_tpu if platform == "tpu" else moe_ffn_fused_ragged_v2
 
     print(f"Device: {kind} | dtype={dtype_name} | interpret={interpret} "
-          f"| kernel={fused_impl.__name__}")
+          f"| kernels={fused_impl.__name__},{ragged_impl.__name__}")
     if interpret:
         print("  (interpret mode: correctness only, timings are meaningless)")
     print(
         f"Shapes: M={tokens} D={d} F={f} G={n_experts} (F/D={f / d:.0f}) | "
-        f"block_m={block_m} f_tile={f_tile}\n"
+        f"block_m={block_m} f_tile={f_tile} | skew={skew}\n"
     )
 
     key = jax.random.key(42)
-    x, w_up, w_down, idx = make_balanced_inputs(
-        key, tokens=tokens, d=d, f=f, n_experts=n_experts, dtype=dtype
+    x, w_up, w_down, idx = make_inputs(
+        key, tokens=tokens, d=d, f=f, n_experts=n_experts, dtype=dtype, skew=skew
     )
 
     # IMPORTANT: arrays must be jit *arguments*, not closed-over constants -
@@ -133,13 +142,22 @@ def run_benchmark(
     fns = {
         "loop": jax.jit(moe_ffn_loop),
         "ragged_dot": jax.jit(moe_ffn_ragged),
-        "fused_pallas": jax.jit(
+        "fused_ragged": jax.jit(
             functools.partial(
-                fused_impl,
+                ragged_impl,
                 block_m=block_m, f_tile=f_tile, interpret=interpret,
             )
         ),
     }
+    if skew == 0:
+        # balanced-only kernel: asserts equal per-expert groups, so it can
+        # only run under round-robin routing
+        fns["fused_pallas"] = jax.jit(
+            functools.partial(
+                fused_impl,
+                block_m=block_m, f_tile=f_tile, interpret=interpret,
+            )
+        )
     args = (x, w_up, w_down, idx)
 
     # correctness vs fp32 loop reference
@@ -167,11 +185,12 @@ def run_benchmark(
         f"({r['traffic_ratio']:.1f}x less)"
     )
     if "pred_speedup" in r:
+        fused_ms = times.get("fused_pallas", times["fused_ragged"])
         print(
             f"Predicted: unfused {r['t_unfused_ms']:.2f} ms, fused {r['t_fused_ms']:.2f} ms "
             f"-> {r['pred_speedup']:.1f}x speedup"
-            f"\nMeasured:  {base:.2f} ms vs {times['fused_pallas']:.2f} ms "
-            f"-> {base / times['fused_pallas']:.1f}x"
+            f"\nMeasured:  {base:.2f} ms vs {fused_ms:.2f} ms "
+            f"-> {base / fused_ms:.1f}x"
         )
     print(
         "\nWhy fusion wins when F > D (and the op is memory-bound):"
@@ -195,6 +214,11 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--dtype", choices=list(_DTYPES), default="f16")
     parser.add_argument(
+        "--skew", type=float, default=0.0,
+        help="Fraction of tokens routed to expert 0 (0 = balanced round-robin; "
+        "skewed routing drops the balanced-only fused_pallas kernel)",
+    )
+    parser.add_argument(
         "--interpret", action=argparse.BooleanOptionalAction, default=None,
         help="Force Pallas interpret mode (default: auto - on for CPU, off for GPU)",
     )
@@ -209,6 +233,7 @@ def main() -> None:
         iters=args.iters,
         dtype_name=args.dtype,
         interpret=args.interpret,
+        skew=args.skew,
     )
 
 

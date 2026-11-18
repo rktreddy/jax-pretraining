@@ -37,14 +37,14 @@ def _fused_kernel(x_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, d_ff: int):
 
     for j in range(d_ff // f_tile):  # static bound -> unrolled at trace time
         # (D, f_tile) slice of this expert's up-projection, HBM -> SRAM
-        wu = pl.load(wu_ref, (e, slice(None), pl.dslice(j * f_tile, f_tile)))
+        wu = wu_ref[e, :, pl.ds(j * f_tile, f_tile)]
         # (bm, f_tile) sliver of the hidden activation. This is the fusion:
         # h lives only in SRAM/registers and dies at the end of the iteration -
         # the full (bm, F) intermediate never exists.
         h = jax.nn.gelu(jnp.dot(x, wu, preferred_element_type=jnp.float32))
         h = h.astype(x.dtype)  # back to input dtype so the MMA units engage
         # (f_tile, D) slice of the down-projection
-        wd = pl.load(wd_ref, (e, pl.dslice(j * f_tile, f_tile), slice(None)))
+        wd = wd_ref[e, pl.ds(j * f_tile, f_tile), :]
         # partial contraction over this F tile; fp32 accumulation
         acc = acc + jnp.dot(h, wd, preferred_element_type=jnp.float32)
 
@@ -63,21 +63,21 @@ def _fused_kernel_ragged(x_ref, bte_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, 
         wd_ref:  (G, F, D) full array in HBM - load tiles manually
         y_ref:   (bm, D) output block in SRAM
     """
-    e = pl.load(bte_ref, (pl.program_id(0),))  # which expert this program serves
+    e = bte_ref[pl.program_id(0)]  # which expert this program serves
 
     x = x_ref[...]  # (bm, D) - staged into SRAM by the BlockSpec
     acc = jnp.zeros((x.shape[0], x.shape[1]), dtype=jnp.float32)
 
     for j in range(d_ff // f_tile):  # static bound -> unrolled at trace time
         # (D, f_tile) slice of this expert's up-projection, HBM -> SRAM
-        wu = pl.load(wu_ref, (e, slice(None), pl.dslice(j * f_tile, f_tile)))
+        wu = wu_ref[e, :, pl.ds(j * f_tile, f_tile)]
         # (bm, f_tile) sliver of the hidden activation. This is the fusion:
         # h lives only in SRAM/registers and dies at the end of the iteration -
         # the full (bm, F) intermediate never exists.
         h = jax.nn.gelu(jnp.dot(x, wu, preferred_element_type=jnp.float32))
         h = h.astype(x.dtype)  # back to input dtype so the MMA units engage
         # (f_tile, D) slice of the down-projection
-        wd = pl.load(wd_ref, (e, pl.dslice(j * f_tile, f_tile), slice(None)))
+        wd = wd_ref[e, pl.ds(j * f_tile, f_tile), :]
         # partial contraction over this F tile; fp32 accumulation
         acc = acc + jnp.dot(h, wd, preferred_element_type=jnp.float32)
 

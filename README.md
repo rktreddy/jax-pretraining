@@ -51,7 +51,13 @@ model shapes the kernel:
 
 Fusion only pays when the op is memory-bound: on a T4, that means fp16 and D ≲ 200
 (critical intensity ~217 FLOPs/byte fp16 vs ~27 fp32). The benchmark prints its own
-roofline prediction next to the measurement.
+roofline prediction next to the measurement, in two versions: weights read once
+(~3.6x on T4 at M=65536, D=64, F=1024), and weights re-loaded per token block, which is
+what the kernels issue (~1.9x at block_m=128). GPU L2 can absorb the re-reads. TPU
+has no such cache, except that `f_tile == F` keeps the weight block index fixed across
+an expert's token blocks, so the pipeline skips the copy. `--sweep-block-m` and
+`--sweep-f-tile` measure where the truth lands. No hardware numbers yet: T4 (sm_75)
+cannot compile Triton Pallas kernels.
 
 ## Layout
 
@@ -98,5 +104,6 @@ Things this exercise actually taught, mostly the hard way:
 - Scaling-law fitting is as much methodology as data: unconstrained least squares
   happily returns a negative irreducible loss.
 - Whether kernel fusion pays is a property of the chip's compute:bandwidth ratio,
-  not the kernel: the same code flips from "cannot win" to "~3.5x predicted" between
-  fp32 and fp16, and between TPU v2 and v5e.
+  not the kernel: the same code flips from "cannot win" to "~2-4x predicted" between
+  fp32 and fp16, and between TPU v2 and v5e. The first-cut roofline also missed
+  per-block weight re-reads, which halve the T4 prediction (3.6x to 1.9x).

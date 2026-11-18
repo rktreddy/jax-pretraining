@@ -1,7 +1,7 @@
 [project]
 name = "jax-pretraining"
 version = "0.1.0"
-description = "Add your description here"
+description = "JAX pretraining exercises: addition transformer, dense-vs-MoE Chinchilla sweep, fused Pallas MoE kernel"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

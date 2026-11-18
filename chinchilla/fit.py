@@ -77,14 +77,63 @@ def fit_scaling_law_free(
     Uses relative error weighting (sigma = loss) so small late-training losses
     count as much as large early ones.
     """
-    from scipy.optimize import curve_fit
+    n, d, loss = _arrays(runs, use_active_params)
+    n0 = float(np.exp(np.mean(np.log(n))))
+    d0 = float(np.exp(np.mean(np.log(d))))
+    return _fit_free(n, d, loss, n0, d0)
 
+
+def bootstrap_free_fit(
+    runs: list[dict],
+    *,
+    n_boot: int = 1000,
+    ci: float = 0.95,
+    seed: int = 0,
+    use_active_params: bool = True,
+) -> dict:
+    """Percentile bootstrap CIs for the free fit (case resampling over runs).
+
+    Centering (N0, D0) is pinned to the full data so a, b keep one meaning
+    across resamples. Resamples with fewer than 5 distinct (N, D) points
+    cannot pin 4 parameters and are skipped, as are fits that fail to
+    converge. Also reports the compute-optimal allocation exponent
+    N_opt ~ C^(beta/(alpha+beta)).
+
+    Returns {"a": (lo, hi), ..., "alloc_exp": (lo, hi), "n_ok": int}.
+    """
+    n, d, loss = _arrays(runs, use_active_params)
+    n0 = float(np.exp(np.mean(np.log(n))))
+    d0 = float(np.exp(np.mean(np.log(d))))
+    rng = np.random.default_rng(seed)
+    samples = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(runs), len(runs))
+        if len(set(zip(n[i], d[i]))) < 5:
+            continue
+        try:
+            f = _fit_free(n[i], d[i], loss[i], n0, d0)
+        except RuntimeError:  # curve_fit: no convergence within maxfev
+            continue
+        samples.append((f.a, f.b, f.alpha, f.beta, f.beta / (f.alpha + f.beta)))
+    if not samples:
+        raise ValueError("no bootstrap resample produced a fit")
+    s = np.array(samples)
+    q = 100 * np.array([(1 - ci) / 2, (1 + ci) / 2])
+    lo, hi = np.percentile(s, q, axis=0)
+    names = ("a", "b", "alpha", "beta", "alloc_exp")
+    return {k: (float(l), float(h)) for k, l, h in zip(names, lo, hi)} | {"n_ok": len(s)}
+
+
+def _arrays(runs: list[dict], use_active_params: bool) -> tuple[np.ndarray, ...]:
     key = "n_active_params" if use_active_params else "n_params"
     n = np.array([r[key] for r in runs], dtype=np.float64)
     d = np.array([r["tokens"] for r in runs], dtype=np.float64)
     loss = np.array([r["final_loss"] for r in runs], dtype=np.float64)
-    n0 = float(np.exp(np.mean(np.log(n))))
-    d0 = float(np.exp(np.mean(np.log(d))))
+    return n, d, loss
+
+
+def _fit_free(n, d, loss, n0: float, d0: float) -> FreeScalingLawFit:
+    from scipy.optimize import curve_fit
 
     def model(x, a, b, alpha, beta):
         nn, dd = x
@@ -135,12 +184,12 @@ def compute_optimal_allotment(
     *,
     use_active_params: bool = True,
 ) -> tuple[float, float, float]:
-    """Chinhilla compute-optimal N, D for budget C = 6ND (active params)."""
+    """Chinchilla compute-optimal N, D for budget C = 6ND (active params)."""
     # N_opt = G * (C/6)^(0.5) style - from minimizing L s.t C=6ND
     # Standard result: N = C^a, D \prop C^b with a=b=0.5 for symmetric 6ND
     # More precisely with L = E + A/N^{alpha} + B/D^{beta} and C=6ND:
     # N_opt = ((alpha A)/beta B)^(1/(alpha+beta)) * (flops_budget / 6.0) ** (beta / (alpha + beta))
-    # D_opt = C / (6 + N_opt)
+    # D_opt = C / (6 * N_opt)
     alpha, beta = fit.alpha, fit.beta
     ratio = (alpha * fit.A) / (beta * fit.B)
     n_opt = ratio ** (1.0 / (alpha + beta)) * (flops_budget / 6.0) ** (beta /(alpha + beta))

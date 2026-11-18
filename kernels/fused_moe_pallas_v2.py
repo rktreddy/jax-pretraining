@@ -53,13 +53,15 @@ def _fused_kernel(x_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, d_ff: int):
 
 
 def _fused_kernel_ragged(x_ref, bte_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, d_ff: int):
-    """One (expert, token-block) program.
+    """One token-block program, ragged routing.
 
     Refs:
-        x_ref:  (1, bm, D) block in SRAM (BlockSpec-staged)
-        wu_ref: (G, D, F) full array in HBM - load tiles manually
-        wd_ref: (G, F, D) full array in HBM - load tiles manually
-        y_ref:  (1, bm, D) output block in SRAM
+        x_ref:   (bm, D) block in SRAM (BlockSpec-staged)
+        bte_ref: (n_blocks,) int32 block_to_expert map in HBM - read the
+                 one scalar for this program's block
+        wu_ref:  (G, D, F) full array in HBM - load tiles manually
+        wd_ref:  (G, F, D) full array in HBM - load tiles manually
+        y_ref:   (bm, D) output block in SRAM
     """
     e = pl.load(bte_ref, (pl.program_id(0),))  # which expert this program serves
 

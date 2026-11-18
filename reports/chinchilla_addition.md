@@ -39,12 +39,15 @@ dense vs top-1 MoE, trained without curriculum (uniform operands from step 1).
 Model: `L(N, D) = a * (N/N0)^-alpha + b * (D/D0)^-beta` with all four
 parameters fitted (E pinned to 0: addition is deterministic, so the
 irreducible loss is zero). Centered at the per-architecture geometric
-means (N0, D0); relative-error weighting.
+means (N0, D0); relative-error weighting. Brackets are 95% percentile
+bootstrap CIs (1000 case resamples over runs; resamples with < 5
+distinct (N, D) points skipped). `N_opt ~ C^x` is the compute-optimal
+allocation exponent x = beta/(alpha+beta).
 
-| arch | a | alpha | b | beta | rel. rmse |
-|------|---|-------|---|------|-----------|
-| dense | 0.0097 | 1.49 | 0.0279 | 2.33 | 0.39 |
-| moe | 0.0033 | 1.91 | 0.0367 | 2.14 | 0.35 |
+| arch | a | alpha | b | beta | N_opt ~ C^x | rel. rmse |
+|------|---|-------|---|------|-------------|-----------|
+| dense | 0.0097 [0.0001, 0.0367] | 1.49 [0.90, 4.00] | 0.0279 [0.0164, 0.0450] | 2.33 [1.72, 4.00] | 0.61 [0.34, 0.78] | 0.39 |
+| moe | 0.0033 [0.0001, 0.0257] | 1.91 [0.82, 4.00] | 0.0367 [0.0248, 0.0450] | 2.14 [1.96, 4.00] | 0.53 [0.34, 0.78] | 0.35 |
 
 ### dense: compute-optimal allocation
 
@@ -68,11 +71,15 @@ active parameters and equal tokens, MoE losses track dense within noise
 nearly identical across architectures. Top-1 MoE buys ~3x total parameters at
 the same active-parameter loss - the canonical MoE claim, reproduced at toy
 scale. The MoE fit shows a slightly larger data coefficient (more data-hungry),
-consistent with routing overhead, but with ~9 points per architecture this is
-suggestive rather than conclusive.
+consistent with routing overhead, but the bootstrap CIs on every parameter
+overlap between architectures: with ~9 points each, this is not a detectable
+difference.
 
-**2. The exponents are 5-8x steeper than language-model Chinchilla.** We fit
-alpha ~ 1.5, beta ~ 2.3 versus Chinchilla's 0.34 / 0.28. Fitting with the
+**2. The exponents are far steeper than language-model Chinchilla.** We fit
+alpha ~ 1.5, beta ~ 2.3 versus Chinchilla's 0.34 / 0.28. Even the bootstrap
+lower bounds (alpha >= 0.8, beta >= 1.7) are 2-6x the language values; the upper
+bounds sit on the fit's bound (4.0), so the steepness is only bounded below.
+Fitting with the
 language exponents *fixed* fails outright (negative B, complex compute-optimal
 allocations). Addition is a deterministic, saturable task: loss does not glide
 down a smooth power law but drops sharply once the model masters a digit class
@@ -80,10 +87,11 @@ down a smooth power law but drops sharply once the model masters a digit class
 which is why its power laws are shallow and smooth. This is also why the
 residuals here stay large (rel. rmse ~0.4): phase transitions do not power-law.
 
-**3. Allocation tilts toward parameters.** beta/(alpha+beta) ~ 0.6, i.e. grow N
-slightly faster than D as compute scales - unlike language Chinchilla's
-balanced ~0.5 split (D/N ~ 20 at LLM scale). Small models are the bottleneck
-for this task; data is cheap (synthetic and infinite).
+**3. Allocation is not pinned down.** The point estimate beta/(alpha+beta) ~ 0.6
+(dense) would mean growing N slightly faster than D as compute scales, but
+its 95% CI [0.34, 0.78] spans language Chinchilla's balanced ~0.5 split. The
+sweep cannot distinguish a parameter tilt from a balanced allocation; that
+needs more model sizes, not more token budgets at the same three sizes.
 
 **Caveats:** 3 model sizes x 3 token budgets per architecture; single seed;
 constants are task-specific and do not transfer anywhere. The methodology -

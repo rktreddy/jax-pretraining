@@ -28,12 +28,17 @@ import jax
 import jax.numpy as jnp
 
 from kernels.fused_moe_pallas_v2 import (
+    fused_moe_pallas_tpu_sorted,
+    fused_moe_pallas_v2_sorted,
+    fused_moe_ragged_tpu_padded,
+    fused_moe_ragged_v2_padded,
     moe_ffn_fused_pallas_tpu,
     moe_ffn_fused_pallas_v2,
     moe_ffn_fused_ragged_tpu,
     moe_ffn_fused_ragged_v2,
 )
 from moe.ragged_moe import moe_ffn_loop, moe_ffn_ragged
+from moe.routing import route_tokens, route_tokens_block_padded, unroute_tokens
 
 # (fp16/bf16 matmul FLOP/s, fp32 matmul FLOP/s, HBM bytes/s) - approximate peaks
 # TPU entries are per core (one Pallas kernel runs on one core).
@@ -77,11 +82,23 @@ def make_inputs(key, *, tokens, d, f, n_experts, dtype, skew=0.0):
 def bench(fn, *args, warmup: int = 3, iters: int = 20) -> float:
     """Mean seconds per call over `iters` timed calls, after warmup."""
     for _ in range(warmup):
-        fn(*args).block_until_ready()
+        jax.block_until_ready(fn(*args))
     t0 = time.perf_counter()
     for _ in range(iters):
-        fn(*args).block_until_ready()
+        jax.block_until_ready(fn(*args))
     return (time.perf_counter() - t0) / iters
+
+
+def _platform_setup(dtype_name: str, interpret: bool | None):
+    """Resolve device, dtype (TPU has no fp16) and interpret mode."""
+    kind, peaks = device_peaks()
+    platform = jax.devices()[0].platform
+    if platform == "tpu" and dtype_name == "f16":
+        print("TPU has no fp16 - switching to bf16")
+        dtype_name = "bf16"
+    if interpret is None:
+        interpret = platform == "cpu"
+    return kind, peaks, platform, dtype_name, interpret
 
 
 def roofline(tokens, d, f, g, itemsize, peaks, *, block_m) -> dict:
@@ -148,15 +165,9 @@ def run_benchmark(
 
     Returns a JSON-serializable dict of the config, timings and predictions.
     """
-    kind, peaks = device_peaks()
-    platform = jax.devices()[0].platform
-    if platform == "tpu" and dtype_name == "f16":
-        print("TPU has no fp16 - switching to bf16")
-        dtype_name = "bf16"
+    kind, peaks, platform, dtype_name, interpret = _platform_setup(dtype_name, interpret)
     dtype = _DTYPES[dtype_name]
     itemsize = jnp.dtype(dtype).itemsize
-    if interpret is None:
-        interpret = platform == "cpu"
     fused_impl = moe_ffn_fused_pallas_tpu if platform == "tpu" else moe_ffn_fused_pallas_v2
     ragged_impl = moe_ffn_fused_ragged_tpu if platform == "tpu" else moe_ffn_fused_ragged_v2
 
@@ -281,6 +292,116 @@ def run_benchmark(
     }
 
 
+def run_breakdown(
+    tokens: int,
+    d: int,
+    f: int,
+    n_experts: int,
+    block_m: int,
+    f_tile: int,
+    iters: int,
+    dtype_name: str,
+    interpret: bool | None,
+    skew: float = 0.0,
+    trace_dir: Path | None = None,
+) -> dict:
+    """Time each stage of every MoE path in isolation (route / compute /
+    unroute vs the full call), to locate cost the HBM roofline misses.
+
+    Stage inputs are precomputed, so each stage is its own jitted call.
+    sum != full is itself informative: XLA fuses across stage boundaries
+    in the full call, and each separate call pays its own dispatch.
+    """
+    kind, _, platform, dtype_name, interpret = _platform_setup(dtype_name, interpret)
+    dtype = _DTYPES[dtype_name]
+    tpu = platform == "tpu"
+    sorted_impl = fused_moe_pallas_tpu_sorted if tpu else fused_moe_pallas_v2_sorted
+    padded_impl = fused_moe_ragged_tpu_padded if tpu else fused_moe_ragged_v2_padded
+    fused_impl = moe_ffn_fused_pallas_tpu if tpu else moe_ffn_fused_pallas_v2
+    ragged_impl = moe_ffn_fused_ragged_tpu if tpu else moe_ffn_fused_ragged_v2
+
+    print(f"Breakdown | device: {kind} | dtype={dtype_name} | interpret={interpret}")
+    print(f"Shapes: M={tokens} D={d} F={f} G={n_experts} | "
+          f"block_m={block_m} f_tile={f_tile} | skew={skew}\n")
+
+    g = n_experts
+    x, w_up, w_down, idx = make_inputs(
+        jax.random.key(42), tokens=tokens, d=d, f=f, n_experts=g, dtype=dtype, skew=skew
+    )
+    kw = dict(block_m=block_m, f_tile=f_tile, interpret=interpret)
+    sorted_x, group_sizes, _, inv = route_tokens(x, idx, g)
+    padded_x, bte, dest = route_tokens_block_padded(x, idx, g, block_m)
+    h = jax.nn.gelu(jax.lax.ragged_dot(sorted_x, w_up, group_sizes))
+
+    route = (jax.jit(lambda x, i: route_tokens(x, i, g)), (x, idx))
+    unroute = (jax.jit(lambda y, inv: unroute_tokens(y, inv, x.shape)), (sorted_x, inv))
+    paths = {
+        "ragged_dot": {
+            "route": route,
+            "up+gelu": (jax.jit(lambda s, w, gs: jax.nn.gelu(jax.lax.ragged_dot(s, w, gs))),
+                        (sorted_x, w_up, group_sizes)),
+            "down": (jax.jit(jax.lax.ragged_dot), (h, w_down, group_sizes)),
+            "unroute": unroute,
+            "full": (jax.jit(moe_ffn_ragged), (x, w_up, w_down, idx)),
+        },
+        "fused_ragged": {
+            "route": (jax.jit(lambda x, i: route_tokens_block_padded(x, i, g, block_m)),
+                      (x, idx)),
+            "kernel": (jax.jit(functools.partial(padded_impl, **kw)),
+                       (padded_x, bte, w_up, w_down)),
+            "unroute": (jax.jit(lambda y, dst: y[dst]), (padded_x, dest)),
+            "full": (jax.jit(functools.partial(ragged_impl, **kw)), (x, w_up, w_down, idx)),
+        },
+    }
+    if skew == 0 and (tokens // g) % block_m == 0:
+        paths["fused_pallas"] = {
+            "route": route,
+            "kernel": (jax.jit(functools.partial(sorted_impl, **kw)), (sorted_x, w_up, w_down)),
+            "unroute": unroute,
+            "full": (jax.jit(functools.partial(fused_impl, **kw)), (x, w_up, w_down, idx)),
+        }
+
+    times: dict[str, dict[str, float]] = {}
+    errors = {}
+    print(f"{'path':14s} {'stage':10s} {'ms':>9s} {'% of full':>10s}")
+    print("-" * 46)
+    for path, stages in paths.items():
+        t = {}
+        for stage, (fn, args) in stages.items():
+            try:
+                t[stage] = bench(fn, *args, iters=iters) * 1e3
+            except Exception as e:  # noqa: BLE001 - report any lowering failure
+                errors[f"{path}/{stage}"] = str(e).strip().splitlines()[0][:200]
+                print(f"{path:14s} {stage:10s}   FAILED: {errors[f'{path}/{stage}']}")
+        times[path] = t
+        full = t.get("full")
+        parts = {k: v for k, v in t.items() if k != "full"}
+        for stage, ms in parts.items():
+            pct = f"{100 * ms / full:9.0f}%" if full else ""
+            print(f"{path:14s} {stage:10s} {ms:9.3f} {pct}")
+        print(f"{'':14s} {'sum':10s} {sum(parts.values()):9.3f}")
+        if full:
+            print(f"{'':14s} {'full':10s} {full:9.3f}")
+        print()
+
+    if trace_dir:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        with jax.profiler.trace(str(trace_dir)):
+            for path, stages in paths.items():
+                fn, args = stages["full"]
+                if f"{path}/full" not in errors:
+                    for _ in range(3):
+                        jax.block_until_ready(fn(*args))
+        print(f"Profiler trace written to {trace_dir} (open with xprof / TensorBoard)")
+
+    return {
+        "mode": "breakdown", "device": kind, "platform": platform, "dtype": dtype_name,
+        "interpret": interpret, "tokens": tokens, "d": d, "f": f, "experts": g,
+        "block_m": block_m, "f_tile": f_tile, "skew": skew, "iters": iters,
+        "times_ms": times, "errors": errors,
+    }
+
+
 def _int_list(s: str) -> list[int]:
     return [int(v) for v in s.split(",") if v]
 
@@ -314,19 +435,43 @@ def main() -> None:
         help="Force Pallas interpret mode (default: auto - on for CPU, off for GPU)",
     )
     parser.add_argument("--json", type=Path, default=None, help="Write results as JSON here")
-    args = parser.parse_args()
-    result = run_benchmark(
-        tokens=args.tokens,
-        d=args.d,
-        f=args.f,
-        n_experts=args.experts,
-        block_ms=args.sweep_block_m or [args.block_m],
-        f_tiles=args.sweep_f_tile or [args.f_tile],
-        iters=args.iters,
-        dtype_name=args.dtype,
-        interpret=args.interpret,
-        skew=args.skew,
+    parser.add_argument(
+        "--breakdown", action="store_true",
+        help="Instead of the sweep, time route / compute / unroute of each path "
+        "separately at --block-m / --f-tile",
     )
+    parser.add_argument(
+        "--trace", type=Path, default=None, metavar="DIR",
+        help="With --breakdown: also write a jax.profiler trace of the full calls",
+    )
+    args = parser.parse_args()
+    if args.breakdown:
+        result = run_breakdown(
+            tokens=args.tokens,
+            d=args.d,
+            f=args.f,
+            n_experts=args.experts,
+            block_m=args.block_m,
+            f_tile=args.f_tile,
+            iters=args.iters,
+            dtype_name=args.dtype,
+            interpret=args.interpret,
+            skew=args.skew,
+            trace_dir=args.trace,
+        )
+    else:
+        result = run_benchmark(
+            tokens=args.tokens,
+            d=args.d,
+            f=args.f,
+            n_experts=args.experts,
+            block_ms=args.sweep_block_m or [args.block_m],
+            f_tiles=args.sweep_f_tile or [args.f_tile],
+            iters=args.iters,
+            dtype_name=args.dtype,
+            interpret=args.interpret,
+            skew=args.skew,
+        )
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(result, indent=2))

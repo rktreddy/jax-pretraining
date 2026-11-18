@@ -87,14 +87,22 @@ def _fused_kernel_ragged(x_ref, bte_ref, wu_ref, wd_ref, y_ref, *, f_tile: int, 
 
 def moe_ffn_fused_ragged_v2(x, w_up, w_down, expert_idx, *, block_m=128, f_tile=128, interpret=False):
     """Fused MoE FFN for unbalanced (ragged) routing GPU-style."""
-    n_experts, d_model, d_ff = w_up.shape
-    orig_shape = x.shape
     padded_x, block_to_expert, dest = route_tokens_block_padded(
-        x.reshape(-1, x.shape[-1]), expert_idx, n_experts, block_m
+        x.reshape(-1, x.shape[-1]), expert_idx, w_up.shape[0], block_m
     )
+    padded_y = fused_moe_ragged_v2_padded(
+        padded_x, block_to_expert, w_up, w_down,
+        block_m=block_m, f_tile=f_tile, interpret=interpret,
+    )
+    return padded_y[dest].reshape(x.shape)
+
+
+def fused_moe_ragged_v2_padded(padded_x, block_to_expert, w_up, w_down, *, block_m=128, f_tile=128, interpret=False):
+    """Kernel only, on block-padded input from route_tokens_block_padded."""
+    _, d_model, d_ff = w_up.shape
     n_blocks = padded_x.shape[0] // block_m
     kernel = functools.partial(_fused_kernel_ragged, f_tile=f_tile,d_ff=d_ff)
-    padded_y = pl.pallas_call(
+    return pl.pallas_call(
         kernel,
         grid=(n_blocks,),
         in_specs=[
@@ -104,11 +112,9 @@ def moe_ffn_fused_ragged_v2(x, w_up, w_down, expert_idx, *, block_m=128, f_tile=
             pl.BlockSpec(memory_space=pl.ANY),
         ],
         out_specs=pl.BlockSpec((block_m, d_model), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct(padded_x.shape, x.dtype),
+        out_shape=jax.ShapeDtypeStruct(padded_x.shape, padded_x.dtype),
         interpret=interpret,
     )(padded_x, block_to_expert, w_up, w_down)
-    
-    return padded_y[dest].reshape(orig_shape)
 
 
 def fused_moe_pallas_v2_sorted(
@@ -290,13 +296,21 @@ def moe_ffn_fused_ragged_tpu(x, w_up, w_down, expert_idx, *, block_m=128, f_tile
     in SMEM *before* each grid step and feeds it to the index_maps, so the
     weight pipeline itself steers to the right expert per token block.
     """
+    padded_x, block_to_expert, dest = route_tokens_block_padded(
+        x.reshape(-1, x.shape[-1]), expert_idx, w_up.shape[0], block_m
+    )
+    padded_y = fused_moe_ragged_tpu_padded(
+        padded_x, block_to_expert, w_up, w_down,
+        block_m=block_m, f_tile=f_tile, interpret=interpret,
+    )
+    return padded_y[dest].reshape(x.shape)
+
+
+def fused_moe_ragged_tpu_padded(padded_x, block_to_expert, w_up, w_down, *, block_m=128, f_tile=128, interpret=False):
+    """Kernel only, on block-padded input from route_tokens_block_padded."""
     from jax.experimental.pallas import tpu as pltpu
 
-    n_experts, d_model, d_ff = w_up.shape
-    orig_shape = x.shape
-    padded_x, block_to_expert, dest = route_tokens_block_padded(
-        x.reshape(-1, x.shape[-1]), expert_idx, n_experts, block_m
-    )
+    _, d_model, d_ff = w_up.shape
     n_blocks = padded_x.shape[0] // block_m
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -310,14 +324,12 @@ def moe_ffn_fused_ragged_tpu(x, w_up, w_down, expert_idx, *, block_m=128, f_tile
         out_specs=pl.BlockSpec((block_m, d_model), lambda i, j, bte: (i, 0)),
         scratch_shapes=[pltpu.VMEM((block_m, d_model), jnp.float32)],
     )
-    padded_y = pl.pallas_call(
+    return pl.pallas_call(
         _fused_kernel_ragged_tpu,
         grid_spec=grid_spec,
-        out_shape=jax.ShapeDtypeStruct(padded_x.shape, x.dtype),
+        out_shape=jax.ShapeDtypeStruct(padded_x.shape, padded_x.dtype),
         interpret=interpret,
     )(block_to_expert, padded_x, w_up, w_down)
-
-    return padded_y[dest].reshape(orig_shape)
 
 
 def moe_ffn_fused_pallas_tpu(
